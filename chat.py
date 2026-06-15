@@ -67,6 +67,27 @@ SYSTEM_PROMPT = (
 )
 
 
+# ---------- mic device ----------
+def resolve_mic(requested: str) -> str:
+    """Resolve --mic. 'auto' -> find the USB/DJI capture card by name, since the
+    ALSA card NUMBER is not stable across replug (it has already shifted once)."""
+    if requested and requested != "auto":
+        return requested
+    import re
+    try:
+        out = subprocess.check_output(["arecord", "-l"], stderr=subprocess.DEVNULL).decode()
+    except Exception:
+        out = ""
+    for line in out.splitlines():
+        m = re.match(r"card (\d+):", line)
+        if m and re.search(r"DJI|MINI|USB Audio", line, re.I):
+            dev = f"plughw:{m.group(1)},0"
+            print(f"[mic] auto-detected {dev}  ({line.split(':',2)[-1].strip()})")
+            return dev
+    sys.exit("[error] no USB/DJI capture card found (arecord -l). Is the DJI "
+             "receiver plugged in and powered on? Or pass --mic plughw:N,0.")
+
+
 # ---------- listen ----------
 def record_wav(path: str, mic: str, seconds: int) -> None:
     print(f"[mic] recording {seconds}s from {mic} ... speak now")
@@ -202,11 +223,64 @@ def speak(text: str, iface: str) -> None:
     subprocess.run(cmd, check=False)
 
 
+# ---------- continuous conversation (streaming Vosk + endpointing) ----------
+def listen_utterance(model, mic: str) -> str:
+    """Stream the mic into Vosk until it detects end-of-speech; return the text.
+
+    Half-duplex by construction: arecord runs only while we're listening and is
+    stopped before we return — so the robot never hears its own reply. A fresh
+    recognizer per utterance avoids state bleeding across turns.
+    """
+    from vosk import KaldiRecognizer
+    rec = KaldiRecognizer(model, 16000)
+    proc = subprocess.Popen(
+        ["arecord", "-D", mic, "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw", "-q"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    print("[listening… just talk]", end="", flush=True)
+    last_partial = ""
+    try:
+        while True:
+            data = proc.stdout.read(4000)   # ~125 ms
+            if not data:
+                return ""
+            if rec.AcceptWaveform(data):
+                txt = json.loads(rec.Result()).get("text", "").strip()
+                if txt:
+                    return txt
+                # empty final = just silence; keep listening
+            else:
+                p = json.loads(rec.PartialResult()).get("partial", "").strip()
+                if p and p != last_partial:
+                    last_partial = p
+                    print(f"\r[hearing] {p}" + " " * 12, end="", flush=True)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        print("\r" + " " * 60 + "\r", end="", flush=True)
+
+
+def converse(model, mic: str, iface: str, one_turn) -> None:
+    """Hands-free loop: listen -> answer -> listen, no button, Ctrl-C to quit."""
+    print("[conversation] continuous mode — just speak. Ctrl-C to quit.")
+    try:
+        while True:
+            text = listen_utterance(model, mic)
+            if not text:
+                continue
+            one_turn(text)        # think + speak; mic is off during this (half-duplex)
+    except KeyboardInterrupt:
+        print("\nbye")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Voice conversation with the G1.")
     ap.add_argument("--text", help="Skip mic+STT, send this text straight to the LLM.")
     ap.add_argument("--audio", help="Skip the mic, transcribe this wav file.")
-    ap.add_argument("--mic", default="plughw:2,0", help="arecord device (default DJI mic plughw:2,0).")
+    ap.add_argument("--mic", default="auto",
+                    help="arecord device. 'auto' (default) finds the USB/DJI card by name.")
     ap.add_argument("--seconds", type=int, default=6, help="Seconds to record per turn.")
     ap.add_argument("--stt", choices=["vosk", "openai"], default="vosk",
                     help="STT backend (default vosk, local/offline/low-CPU).")
@@ -216,6 +290,8 @@ def main() -> int:
                     help="LLM backend (default openai).")
     ap.add_argument("--iface", default="eth0", help="NIC to the robot DDS.")
     ap.add_argument("--once", action="store_true", help="One turn then exit.")
+    ap.add_argument("--conversation", action="store_true",
+                    help="Hands-free continuous mode: listen->answer->listen, no Enter.")
     args = ap.parse_args()
 
     history: list = []
@@ -233,6 +309,17 @@ def main() -> int:
         one_turn(args.text)
         return 0
 
+    # Hands-free continuous conversation (streaming Vosk, one language at a time).
+    if args.conversation:
+        if args.stt != "vosk":
+            print("[note] --conversation uses local Vosk streaming (ignoring --stt openai).")
+        conv_lang = "zh" if args.lang == "both" else args.lang
+        if args.lang == "both":
+            print("[note] continuous mode streams one language; using zh (use --lang en for English).")
+        model = load_vosk(conv_lang)[conv_lang]
+        converse(model, resolve_mic(args.mic), args.iface, one_turn)
+        return 0
+
     # Load Vosk only if we'll actually use it.
     models = load_vosk(args.lang) if args.stt == "vosk" else None
 
@@ -243,12 +330,13 @@ def main() -> int:
         one_turn(stt(args.audio))
         return 0
 
+    mic = resolve_mic(args.mic)
     print("Press Enter to talk, Ctrl-C to quit.")
     wav = "/tmp/g1_chat_in.wav"
     try:
         while True:
             input()
-            record_wav(wav, args.mic, args.seconds)
+            record_wav(wav, mic, args.seconds)
             t0 = time.time()
             text = stt(wav)
             print(f"[stt] {time.time()-t0:.1f}s")
