@@ -2,9 +2,21 @@
 
 让宇树 G1 用**自己身上的喇叭**说话，并能**和人语音对话**。基于最新 `unitree_sdk2_python`,全新写的,跟旧的 `G1_Speaker`、`g1_tts_demo` 没关系。
 
-- `speak.py` —— 把一段文字念出来(TTS)。
-- `chat.py` —— 完整对话:**听 → 转文字 → 大模型 → 念回复**。
-- `talk.sh` —— 一键启动 `chat.py`(自动加载 key、开麦、找麦克风)。
+本仓库做两件事,别搞混:
+
+**① 给它稿子,让它照着念(单向 TTS,不对话、不联网想词)**
+你提供文字,它原样念出来。适合主持、报幕、播报固定台词。
+
+- `speak.py` —— 念你给的文字。例:`python3 speak.py --zh "各位好，欢迎来到现场"`,或 `--file script.txt` 念整篇稿子。
+- 它**只念**,不会自己加话、不会回答问题。
+
+**② 跟它对话,让它自己想词回答(听→转文字→大模型→念回复)**
+你说话,它听懂后用大模型生成回复再念出来。适合问答、闲聊、语音助手。
+
+- `talk.sh` —— 一键启动对话(自动加载 key、开麦、找麦克风),**日常用这个**。
+- `chat.py` —— 对话的本体;`talk.sh` 就是包了它。也可 `python3 chat.py --text "你是谁？"` 不用麦克风、只测「大脑+喇叭」。
+
+> 一句话:**念稿子 → `speak.py`;跟它聊 → `talk.sh`。**
 
 ## 为什么不用 SDK 自带的 TtsMaker
 
@@ -79,6 +91,12 @@ python3 chat.py --conversation --lang zh    # 连续对话
 export OPENAI_API_KEY=sk-...          # --llm openai 和/或 --stt openai 用
 export ANTHROPIC_API_KEY=sk-ant-...   # --llm anthropic 用
 ```
+
+> **直接跑 `chat.py` 报 `OPENAI_API_KEY not set`?** 它只读环境变量,自己不读这个文件。
+> `talk.sh` 会自动 `source`,但你直接 `python3 chat.py ...` 时不会。两种解法:
+>
+> - 当前 shell 手动加载:`source ~/.unitree_g1.env`
+> - 一劳永逸(已配置):`~/.zshrc` 末尾加 `[ -f ~/.unitree_g1.env ] && source ~/.unitree_g1.env`,以后每次登录自动加载。
 
 `chat.py` 会按回复里有没有中文,自动选中/英文配音。
 
